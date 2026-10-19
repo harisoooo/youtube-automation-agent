@@ -48,6 +48,7 @@ class SystemTest {
       { name: 'FFmpeg Resolution', test: () => this.testFFmpegResolution() },
       { name: 'Gemini Media Provider Selection', test: () => this.testGeminiMediaProvider() },
       { name: 'Slideshow Duration Selection', test: () => this.testSlideshowDurationSelection() },
+      { name: 'Looped Video Duration Bound', test: () => this.testLoopedVideoDurationBound() },
       { name: 'Slideshow Renderer', test: () => this.testSlideshowRenderer() },
       { name: 'Evergreen Template Topics', test: () => this.testEvergreenTopics() },
       { name: 'Walkthrough Module', test: () => this.testWalkthroughModule() },
@@ -315,6 +316,13 @@ class SystemTest {
         const running = agent.app.listen(0, () => resolve(running));
       });
       const { port } = server.address();
+      // Honour a locally configured API_KEY. Without this, a developer who set
+      // API_KEY in .env gets a 401 from the auth guard and the fail-closed
+      // assertion below measures the wrong thing.
+      const authHeaders = {
+        'Content-Type': 'application/json',
+        ...(process.env.API_KEY ? { 'x-api-key': process.env.API_KEY } : {})
+      };
       const response = await fetch(`http://127.0.0.1:${port}/api/dashboard`);
       const dashboard = await response.json();
       if (
@@ -328,7 +336,7 @@ class SystemTest {
       }
       const unavailableStart = await fetch(`http://127.0.0.1:${port}/api/operator/start`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: '{}'
       });
       if (unavailableStart.status !== 503) {
@@ -346,7 +354,7 @@ class SystemTest {
       });
       const approveLearning = await fetch(
         `http://127.0.0.1:${port}/api/learning/recommendations/${learningRecommendation.id}/approve`,
-        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }
+        { method: 'POST', headers: authHeaders, body: '{}' }
       );
       const approvedLearning = await approveLearning.json();
       if (!approveLearning.ok || approvedLearning.result?.status !== 'approved') {
@@ -3037,6 +3045,47 @@ class SystemTest {
     }
 
     this.logger.info('Slideshow duration selection test completed successfully');
+  }
+
+  async testLoopedVideoDurationBound() {
+    const fs = require('fs').promises;
+    const os = require('os');
+    const { runFFmpeg, checkFFmpeg, getMediaDuration } = require('./utils/ffmpeg');
+    const { AIVideoGenerator } = require('./utils/ai-video-generator');
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'yaa-loop-bound-'));
+
+    try {
+      if (!(await checkFFmpeg())) {
+        this.logger.warn('Skipping the looped-video duration assertion because FFmpeg is unavailable');
+        return;
+      }
+
+      const narration = path.join(directory, 'narration.wav');
+      const visual = path.join(directory, 'visual.mp4');
+      const output = path.join(directory, 'final.mp4');
+      await runFFmpeg(['-y', '-f', 'lavfi', '-i', 'sine=frequency=320:duration=4', narration]);
+      await runFFmpeg(['-y', '-f', 'lavfi', '-i', 'color=c=blue:s=320x180:d=4', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', visual]);
+
+      const generator = new AIVideoGenerator({});
+      if (!(await generator.isUsableAudioFile(narration))) {
+        throw new Error('The test narration fixture must be usable audio');
+      }
+      await generator.addAudioToVideo(visual, narration, output, { loopVideo: true });
+
+      const audioDuration = await getMediaDuration(narration);
+      const finalDuration = await getMediaDuration(output);
+      // `-shortest` alone does not bound a `-stream_loop -1` video input: FFmpeg
+      // kept decoding the loop and wrote a tail several times the narration.
+      if (!(finalDuration > 0) || finalDuration > audioDuration + 1) {
+        throw new Error(
+          `A looped video must stop at the narration (${audioDuration}s); got ${finalDuration}s of silent tail`
+        );
+      }
+
+      this.logger.info('Looped video duration bound test completed successfully');
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true }).catch(() => {});
+    }
   }
 
   async testEvergreenTopics() {

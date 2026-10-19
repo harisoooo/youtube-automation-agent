@@ -923,7 +923,20 @@ class AIVideoGenerator {
       : outputPath;
 
     const videoInput = options.loopVideo ? ['-stream_loop', '-1', '-i', videoPath] : ['-i', videoPath];
-    await runFFmpeg(['-y', ...videoInput, '-i', audioPath, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-shortest', muxPath]);
+
+    // `-shortest` does not bound a `-stream_loop -1` input: FFmpeg keeps decoding
+    // the looping video long after the narration ends and writes a silent tail
+    // several times the length of the audio. Probe the narration and pass an
+    // explicit output duration bound when the video is looped.
+    let durationBound = [];
+    if (options.loopVideo) {
+      const audioDuration = Number(await this.getMediaDuration(audioPath));
+      if (Number.isFinite(audioDuration) && audioDuration > 0) {
+        durationBound = ['-t', audioDuration.toFixed(2)];
+      }
+    }
+
+    await runFFmpeg(['-y', ...videoInput, '-i', audioPath, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-shortest', ...durationBound, muxPath]);
 
     if (muxPath !== outputPath) {
       await fs.rename(muxPath, outputPath);
